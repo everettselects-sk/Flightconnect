@@ -1,5 +1,11 @@
 package com.flightconnect.app
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
+import android.net.wifi.WifiNetworkSuggestion
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
@@ -25,9 +31,29 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 class MainActivity : ComponentActivity() {
+    private val wm by lazy { applicationContext.getSystemService(WifiManager::class.java) }
     private val cm by lazy { getSystemService(ConnectivityManager::class.java) }
     private fun wifi(): Network? = cm.allNetworks.firstOrNull {
         cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+    }
+    private fun scanAirlines(): List<String> {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED)
+            return emptyList()
+        return try {
+            wm.scanResults.map { it.SSID }.filter { it.isNotBlank() }
+                .filter { s -> listOf("alaska", "gogo", "delta", "wifi-onboard", "inflight", "aainflight", "southwestwifi").any { s.contains(it, ignoreCase = true) } }
+                .distinct()
+        } catch (_: SecurityException) { emptyList() }
+    }
+    private fun suggestNetwork(ssid: String): String {
+        if (android.os.Build.VERSION.SDK_INT < 29) return "Use Wi-Fi settings to join $ssid."
+        return try {
+            val suggestion = WifiNetworkSuggestion.Builder().setSsid(ssid).build()
+            val result = wm.addNetworkSuggestions(listOf(suggestion))
+            if (result == WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS)
+                "Requested Android to consider $ssid. Approve the system prompt if shown; connection is not guaranteed."
+            else "Android rejected suggestion ($result). Open Wi-Fi settings and select $ssid."
+        } catch (e: Exception) { "Connection request failed: ${e.javaClass.simpleName}" }
     }
     private fun diagnosis(): String {
         val active = cm.activeNetwork?.let(cm::getNetworkCapabilities)
@@ -82,6 +108,10 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 var status by remember { mutableStateOf("Tap Diagnose to check your connection.") }
                 var airline by remember { mutableStateOf("Alaska") }
+                var discovered by remember { mutableStateOf(emptyList<String>()) }
+                val locationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                    status = if (granted) "Permission granted. Tap Find Airline Wi-Fi again." else "Location permission is needed to see nearby Wi-Fi names."
+                }
                 var busy by remember { mutableStateOf(false) }
                 val history = remember { mutableStateListOf<String>() }
                 val scope = rememberCoroutineScope()
@@ -96,7 +126,22 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize()) {
                     Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("FlightConnect", style = MaterialTheme.typography.headlineMedium)
-                        Text("Beta 0.2 • Alaska recovery testing")
+                        Text("Beta 0.3 • AutoConnect foundation")
+                        Text("Find aircraft Wi-Fi", style = MaterialTheme.typography.titleMedium)
+                        Button(onClick = {
+                            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                                locationRequest.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                            } else {
+                                discovered = scanAirlines()
+                                status = if (discovered.isEmpty()) "No known airline SSIDs in available scan results. Turn on Location and Wi-Fi, wait, then retry." else "Found: " + discovered.joinToString()
+                                record(status)
+                            }
+                        }, modifier = Modifier.fillMaxWidth()) { Text("Find Airline Wi-Fi") }
+                        discovered.forEach { ssid ->
+                            OutlinedButton(onClick = { status = suggestNetwork(ssid); record(status) }, modifier = Modifier.fillMaxWidth()) {
+                                Text("Request connection: $ssid")
+                            }
+                        }
                         Text("Recovery is guided; Android does not permit silent hardware resets.", style = MaterialTheme.typography.bodySmall)
                         Button(onClick = { status = diagnosis(); record(status) }, modifier = Modifier.fillMaxWidth()) {
                             Text("1. Diagnose Connection")
@@ -129,7 +174,7 @@ class MainActivity : ComponentActivity() {
                             startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS)); record("Opened network settings")
                         }, modifier = Modifier.fillMaxWidth()) { Text("Open Network Settings") }
                         OutlinedButton(onClick = {
-                            val report = "FlightConnect Beta 0.1\n" + history.joinToString("\n---\n")
+                            val report = "FlightConnect Beta 0.3\n" + history.joinToString("\n---\n")
                             startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                                 type = "text/plain"; putExtra(Intent.EXTRA_TEXT, report)
                             }, "Share diagnostics"))
