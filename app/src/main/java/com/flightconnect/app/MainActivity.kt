@@ -1,6 +1,9 @@
 package com.flightconnect.app
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSuggestion
@@ -37,6 +40,9 @@ class MainActivity : ComponentActivity() {
     private fun wifi(): Network? = cm.allNetworks.firstOrNull {
         cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
     }
+    private fun requestScan(): Boolean = try {
+        wm.startScan()
+    } catch (_: SecurityException) { false }
     private fun scanAirlines(): List<String> {
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED)
             return emptyList()
@@ -122,8 +128,28 @@ class MainActivity : ComponentActivity() {
                 var status by remember { mutableStateOf("Tap Diagnose to check your connection.") }
                 var airline by remember { mutableStateOf("Alaska") }
                 var discovered by remember { mutableStateOf(emptyList<String>()) }
+                var autoStatus by remember { mutableStateOf("Preparing automatic discovery…") }
+                DisposableEffect(Unit) {
+                    val receiver = object : BroadcastReceiver() {
+                        override fun onReceive(context: Context, intent: Intent) {
+                            discovered = scanAirlines()
+                            autoStatus = if (discovered.isEmpty()) "Searching for airline Wi-Fi…" else "Found: " + discovered.joinToString()
+                        }
+                    }
+                    val filter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
+                    registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                    onDispose { unregisterReceiver(receiver) }
+                }
+                LaunchedEffect(Unit) {
+                    if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                        requestScan()
+                        discovered = scanAirlines()
+                        autoStatus = if (discovered.isEmpty()) "Searching for airline Wi-Fi…" else "Found: " + discovered.joinToString()
+                    } else autoStatus = "Allow location access once to enable Wi-Fi discovery."
+                }
                 val locationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-                    status = if (granted) "Permission granted. Tap Find Airline Wi-Fi again." else "Location permission is needed to see nearby Wi-Fi names."
+                    status = if (granted) "Permission granted. Starting discovery." else "Location permission is needed to see nearby Wi-Fi names."
+                    if (granted) { requestScan(); discovered = scanAirlines() }
                 }
                 var busy by remember { mutableStateOf(false) }
                 val history = remember { mutableStateListOf<String>() }
@@ -139,12 +165,14 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("FlightConnect", style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.secondary)
-                        Text("Beta 0.3 • AutoConnect foundation")
+                        Text("Beta 0.5 • Automatic discovery")
+                        Text(autoStatus, color = MaterialTheme.colorScheme.secondary)
                         Text("Find aircraft Wi-Fi", style = MaterialTheme.typography.titleMedium)
                         Button(onClick = {
                             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
                                 locationRequest.launch(Manifest.permission.ACCESS_FINE_LOCATION)
                             } else {
+                                requestScan()
                                 discovered = scanAirlines()
                                 status = if (discovered.isEmpty()) "No known airline SSIDs in available scan results. Turn on Location and Wi-Fi, wait, then retry." else "Found: " + discovered.joinToString()
                                 record(status)
