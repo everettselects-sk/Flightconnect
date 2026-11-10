@@ -7,7 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -26,5 +26,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: FlightConnect-beta01-debug-apk
+          name: FlightConnect-beta-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish direct-download beta APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk FlightConnect-beta.apk
+          if gh release view beta-latest >/dev/null 2>&1; then
+            gh release upload beta-latest FlightConnect-beta.apk --clobber
+          else
+            gh release create beta-latest FlightConnect-beta.apk --title "FlightConnect Beta (latest)" --notes "Latest automatically built Android beta APK. Debug-signed; install only if you trust this repository." --prerelease
+          fi
