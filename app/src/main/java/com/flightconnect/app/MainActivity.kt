@@ -24,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.Color
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -105,7 +106,19 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme {
+            val flightColors = darkColorScheme(
+                primary = Color(0xFF8E6BE8),
+                onPrimary = Color.White,
+                secondary = Color(0xFF49E5A1),
+                background = Color(0xFF0B1020),
+                onBackground = Color(0xFFF5F4FA),
+                surface = Color(0xFF151B2D),
+                onSurface = Color(0xFFF5F4FA),
+                surfaceVariant = Color(0xFF232A3E),
+                onSurfaceVariant = Color(0xFFD6D3E2),
+                outline = Color(0xFF687088)
+            )
+            MaterialTheme(colorScheme = flightColors) {
                 var status by remember { mutableStateOf("Tap Diagnose to check your connection.") }
                 var airline by remember { mutableStateOf("Alaska") }
                 var discovered by remember { mutableStateOf(emptyList<String>()) }
@@ -123,9 +136,9 @@ class MainActivity : ComponentActivity() {
                     startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
                     record("Opened $url")
                 }
-                Surface(Modifier.fillMaxSize()) {
+                Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("FlightConnect", style = MaterialTheme.typography.headlineMedium)
+                        Text("FlightConnect", style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.secondary)
                         Text("Beta 0.3 • AutoConnect foundation")
                         Text("Find aircraft Wi-Fi", style = MaterialTheme.typography.titleMedium)
                         Button(onClick = {
