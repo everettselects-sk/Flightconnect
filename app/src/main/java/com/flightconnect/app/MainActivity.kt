@@ -15,6 +15,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -56,6 +58,24 @@ class MainActivity : ComponentActivity() {
             "Wi-Fi-only check failed: ${e.javaClass.simpleName}: ${e.message ?: "unknown"}"
         }
     }
+    private suspend fun recoveryCheck(): String = withContext(Dispatchers.IO) {
+        val net = wifi() ?: return@withContext "Aircraft Wi-Fi not connected. Open Wi-Fi settings and join the onboard network."
+        val endpoints = listOf("http://connectivitycheck.gstatic.com/generate_204", "https://www.google.com/generate_204")
+        val results = endpoints.map { endpoint ->
+            try {
+                val connection = net.openConnection(URL(endpoint)) as HttpURLConnection
+                connection.connectTimeout = 4500
+                connection.readTimeout = 4500
+                connection.instanceFollowRedirects = false
+                try {
+                    val code = connection.responseCode
+                    val redirect = connection.getHeaderField("Location")
+                    "$endpoint → HTTP $code" + (redirect?.let { " (redirect: $it)" } ?: "")
+                } finally { connection.disconnect() }
+            } catch (e: Exception) { "$endpoint → ${e.javaClass.simpleName}" }
+        }
+        results.joinToString("\\n") + "\\n" + "If blocked, open the Alaska portal. No phone restart attempted."
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -74,9 +94,9 @@ class MainActivity : ComponentActivity() {
                     record("Opened $url")
                 }
                 Surface(Modifier.fillMaxSize()) {
-                    Column(Modifier.verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("FlightConnect", style = MaterialTheme.typography.headlineMedium)
-                        Text("Beta 0.1 • Airline Wi-Fi diagnostics")
+                        Text("Beta 0.2 • Alaska recovery testing")
                         Text("Recovery is guided; Android does not permit silent hardware resets.", style = MaterialTheme.typography.bodySmall)
                         Button(onClick = { status = diagnosis(); record(status) }, modifier = Modifier.fillMaxWidth()) {
                             Text("1. Diagnose Connection")
@@ -90,6 +110,10 @@ class MainActivity : ComponentActivity() {
                         Text(status)
                         HorizontalDivider()
                         Text("3. Recover Connection", style = MaterialTheme.typography.titleMedium)
+                        Button(onClick = {
+                            busy = true
+                            scope.launch { status = recoveryCheck(); record(status); busy = false }
+                        }, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Run Recovery Check") }
                         Text("Reconnect to aircraft Wi-Fi if necessary, then reopen its sign-in portal.")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             FilterChip(selected = airline == "Alaska", onClick = { airline = "Alaska" }, label = { Text("Alaska") })
