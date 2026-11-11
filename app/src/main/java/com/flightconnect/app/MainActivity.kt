@@ -1,6 +1,11 @@
 package com.flightconnect.app
 
 import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Notification
+import android.os.Build
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.IntentFilter
@@ -35,6 +40,28 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 class MainActivity : ComponentActivity() {
+    private var lastNotifiedSsid: String? = null
+    private fun notifyReady(ssid: String) {
+        if (lastNotifiedSsid == ssid) return
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel("wifi_ready", "Airline Wi-Fi ready", NotificationManager.IMPORTANCE_HIGH))
+        val intent = Intent(this, MainActivity::class.java).apply {
+            putExtra("connect_ssid", ssid)
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pending = PendingIntent.getActivity(this, 22, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val notification = Notification.Builder(this, "wifi_ready")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("Airline Wi-Fi ready")
+            .setContentText("$ssid found. Tap Connect to request access.")
+            .setContentIntent(pending)
+            .addAction(Notification.Action.Builder(null, "Connect", pending).build())
+            .setAutoCancel(true).build()
+        manager.notify(220, notification)
+        lastNotifiedSsid = ssid
+    }
     private val wm by lazy { applicationContext.getSystemService(WifiManager::class.java) }
     private val cm by lazy { getSystemService(ConnectivityManager::class.java) }
     private fun wifi(): Network? = cm.allNetworks.firstOrNull {
@@ -109,6 +136,10 @@ class MainActivity : ComponentActivity() {
         }
         results.joinToString("\\n") + "\\n" + "If blocked, open the Alaska portal. No phone restart attempted."
     }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -128,11 +159,19 @@ class MainActivity : ComponentActivity() {
                 var status by remember { mutableStateOf("Tap Diagnose to check your connection.") }
                 var airline by remember { mutableStateOf("Alaska") }
                 var discovered by remember { mutableStateOf(emptyList<String>()) }
+                val notificationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+                LaunchedEffect(Unit) {
+                    if (Build.VERSION.SDK_INT >= 33 &&
+                        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                        notificationRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
                 var autoStatus by remember { mutableStateOf("Preparing automatic discovery…") }
                 DisposableEffect(Unit) {
                     val receiver = object : BroadcastReceiver() {
                         override fun onReceive(context: Context, intent: Intent) {
                             discovered = scanAirlines()
+                            discovered.firstOrNull()?.let { notifyReady(it) }
                             autoStatus = if (discovered.isEmpty()) "Searching for airline Wi-Fi…" else "Found: " + discovered.joinToString()
                         }
                     }
@@ -144,12 +183,13 @@ class MainActivity : ComponentActivity() {
                     if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
                         requestScan()
                         discovered = scanAirlines()
+                        discovered.firstOrNull()?.let { notifyReady(it) }
                         autoStatus = if (discovered.isEmpty()) "Searching for airline Wi-Fi…" else "Found: " + discovered.joinToString()
                     } else autoStatus = "Allow location access once to enable Wi-Fi discovery."
                 }
                 val locationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
                     status = if (granted) "Permission granted. Starting discovery." else "Location permission is needed to see nearby Wi-Fi names."
-                    if (granted) { requestScan(); discovered = scanAirlines() }
+                    if (granted) { requestScan(); discovered = scanAirlines(); discovered.firstOrNull()?.let { notifyReady(it) } }
                 }
                 var busy by remember { mutableStateOf(false) }
                 val history = remember { mutableStateListOf<String>() }
@@ -165,8 +205,16 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("FlightConnect", style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.secondary)
-                        Text("Beta 0.5 • Automatic discovery")
+                        Text("Beta 0.6 • Wi-Fi ready notifications")
                         Text(autoStatus, color = MaterialTheme.colorScheme.secondary)
+                        if (intent?.getStringExtra("connect_ssid") != null) {
+                            val target = intent.getStringExtra("connect_ssid")!!
+                            Button(onClick = {
+                                status = suggestNetwork(target)
+                                record(status)
+                                intent.removeExtra("connect_ssid")
+                            }, modifier = Modifier.fillMaxWidth()) { Text("Connect to $target") }
+                        }
                         Text("Find aircraft Wi-Fi", style = MaterialTheme.typography.titleMedium)
                         Button(onClick = {
                             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
