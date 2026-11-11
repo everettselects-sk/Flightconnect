@@ -17,7 +17,6 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.location.LocationManager
 import android.net.Network
-import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -47,6 +46,18 @@ class MainActivity : ComponentActivity() {
     private enum class PermissionRequest { LOCATION, NOTIFICATIONS }
 
     private val setupPreferences by lazy { getSharedPreferences("startup_permissions", MODE_PRIVATE) }
+    private var connectionStatus by mutableStateOf(WifiServiceStatus.CHECKING)
+    private var connectedSsid by mutableStateOf<String?>(null)
+    private var notificationSsid by mutableStateOf<String?>(null)
+    private var identityAccess = false
+    private var defaultRoute by mutableStateOf("Default route: checking…")
+    private val connectionMonitor by lazy {
+        WifiConnectionMonitor(cm, wm) { status, route, ssid ->
+            connectionStatus = status
+            defaultRoute = route
+            connectedSsid = ssid
+        }
+    }
     private var discovered by mutableStateOf(emptyList<String>())
     private var autoStatus by mutableStateOf("Preparing automatic discovery…")
     private var setupDialog by mutableStateOf<SetupDialog?>(null)
@@ -97,6 +108,12 @@ class MainActivity : ComponentActivity() {
     private fun discoveryAvailable(): Boolean = hasPreciseLocation() && deviceLocationEnabled()
 
     private fun refreshScanResults(scanAccepted: Boolean? = null) {
+        val access = discoveryAvailable()
+        if (identityAccess != access) {
+            identityAccess = access
+            connectedSsid = null
+            connectionMonitor.restartForIdentityAccessChange()
+        }
         when {
             !hasPreciseLocation() -> {
                 discoveryStarted = false
@@ -114,9 +131,9 @@ class MainActivity : ComponentActivity() {
             }
             else -> {
                 discovered = scanAirlines()
-                discovered.firstOrNull()?.let(::notifyReady)
+                discovered.firstOrNull()?.let(::notifyFound)
                 autoStatus = when {
-                    discovered.isNotEmpty() -> "Found: " + discovered.joinToString()
+                    discovered.isNotEmpty() -> "Nearby Wi-Fi: " + discovered.joinToString()
                     scanAccepted == false -> "Android did not start a new scan. Using available results; wait a moment and retry."
                     else -> "Searching for airline Wi-Fi…"
                 }
@@ -206,6 +223,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        connectionStatus = WifiServiceStatus.CHECKING
+        connectedSsid = null
+        identityAccess = discoveryAvailable()
+        connectionMonitor.start()
         ContextCompat.registerReceiver(this, discoveryReceiver, IntentFilter().apply {
             addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
             addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
@@ -221,6 +242,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        connectionMonitor.stop()
         unregisterReceiver(discoveryReceiver)
         discoveryStarted = false
         super.onStop()
@@ -236,12 +258,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private var lastNotifiedSsid: String? = null
-    private fun notifyReady(ssid: String) {
+    private fun notifyFound(ssid: String) {
         if (lastNotifiedSsid == ssid) return
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(NotificationChannel("wifi_ready", "Airline Wi-Fi ready", NotificationManager.IMPORTANCE_HIGH))
+        manager.createNotificationChannel(NotificationChannel("wifi_ready", "Airline Wi-Fi found", NotificationManager.IMPORTANCE_HIGH))
         val intent = Intent(this, MainActivity::class.java).apply {
             putExtra("connect_ssid", ssid)
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -249,8 +271,8 @@ class MainActivity : ComponentActivity() {
         val pending = PendingIntent.getActivity(this, 22, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = Notification.Builder(this, "wifi_ready")
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("Airline Wi-Fi ready")
-            .setContentText("$ssid found. Tap Connect to request access.")
+            .setContentTitle("Airline Wi-Fi found")
+            .setContentText("$ssid is nearby. Internet service is not confirmed. Tap Connect to join.")
             .setContentIntent(pending)
             .addAction(Notification.Action.Builder(null, "Connect", pending).build())
             .setAutoCancel(true).build()
@@ -259,9 +281,7 @@ class MainActivity : ComponentActivity() {
     }
     private val wm by lazy { applicationContext.getSystemService(WifiManager::class.java) }
     private val cm by lazy { getSystemService(ConnectivityManager::class.java) }
-    private fun wifi(): Network? = cm.allNetworks.firstOrNull {
-        cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-    }
+    private fun wifi(): Network? = connectionMonitor.selectedNetwork
     private fun requestScan(): Boolean = try {
         discoveryAvailable() && wm.startScan()
     } catch (_: SecurityException) { false }
@@ -269,7 +289,7 @@ class MainActivity : ComponentActivity() {
         if (!discoveryAvailable()) return emptyList()
         return try {
             wm.scanResults.map { it.SSID }.filter { it.isNotBlank() }
-                .filter { s -> listOf("alaska", "gogo", "delta", "wifi-onboard", "inflight", "aainflight", "southwestwifi").any { s.contains(it, ignoreCase = true) } }
+                .filter(::isAircraftWifiCandidate)
                 .distinct()
         } catch (_: SecurityException) { emptyList() }
     }
@@ -283,59 +303,43 @@ class MainActivity : ComponentActivity() {
             else "Android rejected suggestion ($result). Open Wi-Fi settings and select $ssid."
         } catch (e: Exception) { "Connection request failed: ${e.javaClass.simpleName}" }
     }
-    private fun diagnosis(): String {
-        val active = cm.activeNetwork?.let(cm::getNetworkCapabilities)
-        val wifiCaps = wifi()?.let(cm::getNetworkCapabilities)
-        val route = when {
-            active == null -> "No active default network"
-            active.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
-            active.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Cellular (possible fallback)"
-            else -> "Other network"
-        }
-        return "Default route: $route\nWi-Fi connected: ${wifiCaps != null}\nWi-Fi validated: ${wifiCaps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true}\nCaptive portal detected: ${wifiCaps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL) == true}"
-    }
-    private suspend fun probe(): String = withContext(Dispatchers.IO) {
-        val network = wifi() ?: return@withContext "No Wi-Fi network detected. Join the aircraft Wi-Fi first."
-        try {
-            val connection = network.openConnection(URL("https://www.google.com/generate_204")) as HttpURLConnection
-            connection.connectTimeout = 5000
-            connection.readTimeout = 5000
-            connection.instanceFollowRedirects = false
-            connection.useCaches = false
+    private fun diagnosis(): String =
+        "${connectionStatus.title()}\n${connectionStatus.detail()}\n$defaultRoute"
+
+    private suspend fun probe(): String {
+        val network = wifi() ?: return "No single Wi-Fi connection is available to test. Check Wi-Fi settings."
+        val revision = connectionMonitor.revision
+        val result = withContext(Dispatchers.IO) {
             try {
-                val code = connection.responseCode
-                val redirect = connection.getHeaderField("Location")
-                "Wi-Fi-only HTTP $code" + (redirect?.let { "\nRedirect: $it" } ?: "") +
-                    if (code == 204) "\nInternet verified" else "\nPortal or network restriction possible"
-            } finally { connection.disconnect() }
-        } catch (e: Exception) {
-            "Wi-Fi-only check failed: ${e.javaClass.simpleName}: ${e.message ?: "unknown"}"
-        }
-    }
-    private suspend fun recoveryCheck(): String = withContext(Dispatchers.IO) {
-        val net = wifi() ?: return@withContext "Aircraft Wi-Fi not connected. Open Wi-Fi settings and join the onboard network."
-        val endpoints = listOf("http://connectivitycheck.gstatic.com/generate_204", "https://www.google.com/generate_204")
-        val results = endpoints.map { endpoint ->
-            try {
-                val connection = net.openConnection(URL(endpoint)) as HttpURLConnection
-                connection.connectTimeout = 4500
-                connection.readTimeout = 4500
+                // This request is bound to physical Wi-Fi, never the default/cellular/VPN route.
+                val connection = network.openConnection(URL("https://www.google.com/generate_204")) as HttpURLConnection
+                connection.connectTimeout = 5000
+                connection.readTimeout = 5000
                 connection.instanceFollowRedirects = false
+                connection.useCaches = false
                 try {
                     val code = connection.responseCode
-                    val redirect = connection.getHeaderField("Location")
-                    "$endpoint → HTTP $code" + (redirect?.let { " (redirect: $it)" } ?: "")
+                    if (code == 204) "Wi-Fi-only check: internet reached successfully at the time of this test."
+                    else "Wi-Fi-only check: HTTP $code. Internet not confirmed; sign-in or network restrictions may apply."
                 } finally { connection.disconnect() }
-            } catch (e: Exception) { "$endpoint → ${e.javaClass.simpleName}" }
+            } catch (e: Exception) {
+                "Wi-Fi-only check failed (${e.javaClass.simpleName}). The cause is unknown; service may be unavailable or access restricted."
+            }
         }
-        results.joinToString("\\n") + "\\n" + "If blocked, open the Alaska portal. No phone restart attempted."
+        return if (connectionMonitor.isCurrent(network, revision)) result
+        else "Wi-Fi changed during the check. The old result was discarded; check again."
     }
+    private suspend fun recoveryCheck(): String = probe() +
+        "\nIf access is not confirmed, use the detected Wi-Fi sign-in button. No phone restart or network reset was attempted."
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        notificationSsid = intent.getStringExtra("connect_ssid")
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        notificationSsid = intent?.getStringExtra("connect_ssid")
         savedInstanceState?.let {
             locationAttempted = it.getBoolean("locationAttempted")
             locationSettingsOffered = it.getBoolean("locationSettingsOffered")
@@ -357,8 +361,8 @@ class MainActivity : ComponentActivity() {
                 outline = Color(0xFF687088)
             )
             MaterialTheme(colorScheme = flightColors) {
-                var status by remember { mutableStateOf("Tap Diagnose to check your connection.") }
-                var airline by remember { mutableStateOf("Alaska") }
+                var status by remember { mutableStateOf("Connection status updates automatically above. Run a Wi-Fi-only check for a manual test.") }
+                var showDiagnostics by remember { mutableStateOf(false) }
                 setupDialog?.let { dialog ->
                     val dismiss = {
                         setupDialog = null
@@ -408,24 +412,56 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("FlightConnect", style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.secondary)
-                        Text("Beta 0.8 • Automatic setup and discovery")
-                        Text(autoStatus, color = MaterialTheme.colorScheme.secondary)
-                        if (intent?.getStringExtra("connect_ssid") != null) {
-                            val target = intent.getStringExtra("connect_ssid")!!
-                            Button(onClick = {
-                                status = suggestNetwork(target)
-                                record(status)
-                                intent.removeExtra("connect_ssid")
-                            }, modifier = Modifier.fillMaxWidth()) { Text("Connect to $target") }
+                        Text("Beta 0.9 • Automatic Wi-Fi detection")
+                        val action = connectionAction(connectionStatus, connectedSsid, discovered, notificationSsid)
+                        Button(onClick = {
+                            when (action.kind) {
+                                ConnectionActionKind.CONNECT -> {
+                                    if (Build.VERSION.SDK_INT < 29) {
+                                        startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+                                        status = "Select ${action.ssid} in Wi-Fi settings. FlightConnect will detect it when you return."
+                                    } else status = suggestNetwork(action.ssid!!)
+                                    notificationSsid = null
+                                }
+                                ConnectionActionKind.OPEN_PORTAL -> {
+                                    open(action.portal!!.url)
+                                    status = "Opened ${action.portal.name} Wi-Fi site. Follow the site's sign-in instructions."
+                                }
+                                ConnectionActionKind.WIFI_SETTINGS -> {
+                                    startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+                                    status = "Opened Wi-Fi settings. FlightConnect will detect the connection when you return."
+                                }
+                            }
+                            record(status)
+                        }, enabled = !setupInteractionInProgress, modifier = Modifier.fillMaxWidth()) {
+                            Text(action.label)
                         }
-                        Text("Find aircraft Wi-Fi", style = MaterialTheme.typography.titleMedium)
-                        Button(onClick = { retryDiscovery() }, enabled = !setupInteractionInProgress,
-                            modifier = Modifier.fillMaxWidth()) { Text("Find Airline Wi-Fi") }
-                        discovered.forEach { ssid ->
-                            OutlinedButton(onClick = { status = suggestNetwork(ssid); record(status) }, modifier = Modifier.fillMaxWidth()) {
-                                Text("Request connection: $ssid")
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(connectedSsid?.let { "Connected network: $it" } ?: "Connection status", style = MaterialTheme.typography.titleMedium)
+                                Text(connectionStatus.title(), style = MaterialTheme.typography.titleLarge,
+                                    color = if (connectionStatus == WifiServiceStatus.ONLINE)
+                                        MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurface)
+                                Text(connectionStatus.detail())
+                                Text(defaultRoute, style = MaterialTheme.typography.bodySmall)
+                                Text("Tracks the current Wi-Fi connection, not a nearby network name.",
+                                    style = MaterialTheme.typography.bodySmall)
                             }
                         }
+                        Text(autoStatus)
+                        Text(status)
+                        if (connectedSsid != null && detectAirline(connectedSsid) == null) {
+                            Text("Airline not identified from this network name. Android's sign-in or Wi-Fi settings is available without choosing an airline.",
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text("Network names help choose a site but do not verify the network's owner. Follow the crew's Wi-Fi instructions.",
+                            style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { showDiagnostics = !showDiagnostics }) {
+                            Text(if (showDiagnostics) "Hide connection details" else "Connection details and help")
+                        }
+                        if (showDiagnostics) {
+                        OutlinedButton(onClick = { retryDiscovery() }, enabled = !setupInteractionInProgress,
+                            modifier = Modifier.fillMaxWidth()) { Text("Scan again") }
                         Text("Recovery is guided; Android does not permit silent hardware resets.", style = MaterialTheme.typography.bodySmall)
                         Button(onClick = { status = diagnosis(); record(status) }, modifier = Modifier.fillMaxWidth()) {
                             Text("1. Diagnose Connection")
@@ -436,21 +472,13 @@ class MainActivity : ComponentActivity() {
                         }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
                             Text(if (busy) "Checking…" else "2. Verify Internet Over Wi-Fi")
                         }
-                        Text(status)
+                        Text("Last diagnostic result: $status")
                         HorizontalDivider()
                         Text("3. Recover Connection", style = MaterialTheme.typography.titleMedium)
                         Button(onClick = {
                             busy = true
                             scope.launch { status = recoveryCheck(); record(status); busy = false }
                         }, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Run Recovery Check") }
-                        Text("Reconnect to aircraft Wi-Fi if necessary, then reopen its sign-in portal.")
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(selected = airline == "Alaska", onClick = { airline = "Alaska" }, label = { Text("Alaska") })
-                            FilterChip(selected = airline == "Delta", onClick = { airline = "Delta" }, label = { Text("Delta") })
-                        }
-                        Button(onClick = {
-                            open(if (airline == "Alaska") "https://wifi.alaskaair.com" else "https://wifi.delta.com")
-                        }, modifier = Modifier.fillMaxWidth()) { Text("Open $airline Portal") }
                         OutlinedButton(onClick = {
                             startActivity(Intent(Settings.ACTION_WIFI_SETTINGS)); record("Opened Wi-Fi settings")
                         }, modifier = Modifier.fillMaxWidth()) { Text("Open Wi-Fi Settings") }
@@ -458,13 +486,14 @@ class MainActivity : ComponentActivity() {
                             startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS)); record("Opened network settings")
                         }, modifier = Modifier.fillMaxWidth()) { Text("Open Network Settings") }
                         OutlinedButton(onClick = {
-                            val report = "FlightConnect Beta 0.3\n" + history.joinToString("\n---\n")
+                            val report = "FlightConnect Beta 0.9\n" + history.joinToString("\n---\n")
                             startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                                 type = "text/plain"; putExtra(Intent.EXTRA_TEXT, report)
                             }, "Share diagnostics"))
                         }, modifier = Modifier.fillMaxWidth()) { Text("Share Diagnostic Log") }
                         Text("Recent diagnostics", style = MaterialTheme.typography.titleMedium)
                         history.take(8).forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        }
                     }
                 }
             }
