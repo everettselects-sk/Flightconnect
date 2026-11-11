@@ -12,10 +12,10 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSuggestion
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.location.LocationManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -23,6 +23,9 @@ import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
+import androidx.lifecycle.Lifecycle
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -40,6 +43,198 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 class MainActivity : ComponentActivity() {
+    private enum class SetupDialog { LOCATION_PERMISSION, APP_SETTINGS, DEVICE_LOCATION }
+    private enum class PermissionRequest { LOCATION, NOTIFICATIONS }
+
+    private val setupPreferences by lazy { getSharedPreferences("startup_permissions", MODE_PRIVATE) }
+    private var discovered by mutableStateOf(emptyList<String>())
+    private var autoStatus by mutableStateOf("Preparing automatic discovery…")
+    private var setupDialog by mutableStateOf<SetupDialog?>(null)
+    private var permissionRequestInFlight by mutableStateOf<PermissionRequest?>(null)
+    private var settingsInFlight by mutableStateOf(false)
+    private var locationAttempted = false
+    private var locationSettingsOffered = false
+    private var discoveryStarted = false
+    private val setupInteractionInProgress: Boolean
+        get() = permissionRequestInFlight != null || settingsInFlight || setupDialog != null
+
+    private val locationRequest = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        permissionRequestInFlight = null
+        // Read the current grant, including approximate-only choices and changes during recreation.
+        if (!hasPreciseLocation()) {
+            setupDialog = if (shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION))
+                SetupDialog.LOCATION_PERMISSION else SetupDialog.APP_SETTINGS
+        }
+        continueSetup()
+    }
+    private val notificationRequest = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        permissionRequestInFlight = null
+        continueSetup()
+    }
+    private val settingsRequest = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        settingsInFlight = false
+        discoveryStarted = false
+        continueSetup()
+    }
+    private val discoveryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == WifiManager.SCAN_RESULTS_AVAILABLE_ACTION) {
+                refreshScanResults()
+            } else {
+                // Device Location or Wi-Fi can change while this activity remains visible.
+                discoveryStarted = false
+                continueSetup()
+            }
+        }
+    }
+
+    private fun hasPreciseLocation(): Boolean =
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private fun deviceLocationEnabled(): Boolean =
+        LocationManagerCompat.isLocationEnabled(getSystemService(LocationManager::class.java))
+
+    private fun discoveryAvailable(): Boolean = hasPreciseLocation() && deviceLocationEnabled()
+
+    private fun refreshScanResults(scanAccepted: Boolean? = null) {
+        when {
+            !hasPreciseLocation() -> {
+                discoveryStarted = false
+                discovered = emptyList()
+                autoStatus = "Location access is needed to see nearby Wi-Fi names. Allow precise location to scan."
+            }
+            !deviceLocationEnabled() -> {
+                discoveryStarted = false
+                discovered = emptyList()
+                autoStatus = "Device Location is off. Turn it on to discover airline Wi-Fi."
+            }
+            !wm.isWifiEnabled -> {
+                discovered = emptyList()
+                autoStatus = "Wi-Fi is off. Turn it on in Wi-Fi settings to discover airline networks."
+            }
+            else -> {
+                discovered = scanAirlines()
+                discovered.firstOrNull()?.let(::notifyReady)
+                autoStatus = when {
+                    discovered.isNotEmpty() -> "Found: " + discovered.joinToString()
+                    scanAccepted == false -> "Android did not start a new scan. Using available results; wait a moment and retry."
+                    else -> "Searching for airline Wi-Fi…"
+                }
+            }
+        }
+    }
+
+    private fun continueSetup() {
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
+        // Settings can also be changed outside the in-app shortcut while a prompt is visible.
+        if (hasPreciseLocation() && (setupDialog == SetupDialog.LOCATION_PERMISSION || setupDialog == SetupDialog.APP_SETTINGS)) {
+            setupDialog = null
+        }
+        if (deviceLocationEnabled() && setupDialog == SetupDialog.DEVICE_LOCATION) {
+            setupDialog = null
+        }
+        refreshScanResults()
+        while (true) {
+            val action = nextStartupAction(StartupState(
+                resumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+                interactionInProgress = setupInteractionInProgress,
+                preciseLocationGranted = hasPreciseLocation(),
+                deviceLocationEnabled = deviceLocationEnabled(),
+                locationAttempted = locationAttempted,
+                locationRequestedBefore = setupPreferences.getBoolean("location_requested", false),
+                showLocationRationale = shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION),
+                locationSettingsOffered = locationSettingsOffered,
+                discoveryStarted = discoveryStarted,
+                notificationsNeeded = Build.VERSION.SDK_INT >= 33 &&
+                    checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+                    !setupPreferences.getBoolean("notifications_requested", false),
+            ))
+            when (action) {
+                StartupAction.REQUEST_LOCATION -> {
+                    requestLocationAccess()
+                    return
+                }
+                StartupAction.SHOW_APP_SETTINGS -> {
+                    locationAttempted = true
+                    setupDialog = SetupDialog.APP_SETTINGS
+                    return
+                }
+                StartupAction.SHOW_LOCATION_SETTINGS -> {
+                    locationSettingsOffered = true
+                    setupDialog = SetupDialog.DEVICE_LOCATION
+                    return
+                }
+                StartupAction.START_DISCOVERY -> {
+                    discoveryStarted = true
+                    refreshScanResults(requestScan())
+                }
+                StartupAction.REQUEST_NOTIFICATIONS -> {
+                    permissionRequestInFlight = PermissionRequest.NOTIFICATIONS
+                    setupPreferences.edit().putBoolean("notifications_requested", true).apply()
+                    notificationRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    return
+                }
+                StartupAction.WAIT, StartupAction.DONE -> return
+            }
+        }
+    }
+
+    private fun requestLocationAccess() {
+        if (permissionRequestInFlight != null || settingsInFlight) return
+        locationAttempted = true
+        permissionRequestInFlight = PermissionRequest.LOCATION
+        setupPreferences.edit().putBoolean("location_requested", true).apply()
+        locationRequest.launch(arrayOf(
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+        ))
+    }
+
+    private fun openSetupSettings(intent: Intent) {
+        setupDialog = null
+        settingsInFlight = true
+        settingsRequest.launch(intent)
+    }
+
+    private fun retryDiscovery() {
+        if (setupInteractionInProgress) return
+        locationAttempted = false
+        locationSettingsOffered = false
+        discoveryStarted = false
+        continueSetup()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ContextCompat.registerReceiver(this, discoveryReceiver, IntentFilter().apply {
+            addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
+            addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
+            addAction(LocationManager.MODE_CHANGED_ACTION)
+        }, ContextCompat.RECEIVER_NOT_EXPORTED)
+    }
+
+    override fun onPostResume() {
+        super.onPostResume()
+        // AndroidX dispatches ON_RESUME after this callback on newer Android releases.
+        // Posting also covers permission/settings results delivered before the resumed state.
+        window.decorView.post { continueSetup() }
+    }
+
+    override fun onStop() {
+        unregisterReceiver(discoveryReceiver)
+        discoveryStarted = false
+        super.onStop()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("locationAttempted", locationAttempted)
+        outState.putBoolean("locationSettingsOffered", locationSettingsOffered)
+        outState.putBoolean("settingsInFlight", settingsInFlight)
+        outState.putString("permissionRequestInFlight", permissionRequestInFlight?.name)
+        outState.putString("setupDialog", setupDialog?.name)
+        super.onSaveInstanceState(outState)
+    }
+
     private var lastNotifiedSsid: String? = null
     private fun notifyReady(ssid: String) {
         if (lastNotifiedSsid == ssid) return
@@ -68,11 +263,10 @@ class MainActivity : ComponentActivity() {
         cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
     }
     private fun requestScan(): Boolean = try {
-        wm.startScan()
+        discoveryAvailable() && wm.startScan()
     } catch (_: SecurityException) { false }
     private fun scanAirlines(): List<String> {
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED)
-            return emptyList()
+        if (!discoveryAvailable()) return emptyList()
         return try {
             wm.scanResults.map { it.SSID }.filter { it.isNotBlank() }
                 .filter { s -> listOf("alaska", "gogo", "delta", "wifi-onboard", "inflight", "aainflight", "southwestwifi").any { s.contains(it, ignoreCase = true) } }
@@ -142,6 +336,13 @@ class MainActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        savedInstanceState?.let {
+            locationAttempted = it.getBoolean("locationAttempted")
+            locationSettingsOffered = it.getBoolean("locationSettingsOffered")
+            settingsInFlight = it.getBoolean("settingsInFlight")
+            permissionRequestInFlight = it.getString("permissionRequestInFlight")?.let(PermissionRequest::valueOf)
+            setupDialog = it.getString("setupDialog")?.let(SetupDialog::valueOf)
+        }
         setContent {
             val flightColors = darkColorScheme(
                 primary = Color(0xFF8E6BE8),
@@ -158,41 +359,40 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = flightColors) {
                 var status by remember { mutableStateOf("Tap Diagnose to check your connection.") }
                 var airline by remember { mutableStateOf("Alaska") }
-                var discovered by remember { mutableStateOf(emptyList<String>()) }
-                val notificationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
-                LaunchedEffect(Unit) {
-                    if (Build.VERSION.SDK_INT >= 33 &&
-                        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                        notificationRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
+                setupDialog?.let { dialog ->
+                    val dismiss = {
+                        setupDialog = null
+                        continueSetup()
                     }
-                }
-                var autoStatus by remember { mutableStateOf("Preparing automatic discovery…") }
-                DisposableEffect(Unit) {
-                    val receiver = object : BroadcastReceiver() {
-                        override fun onReceive(context: Context, intent: Intent) {
-                            discovered = scanAirlines()
-                            discovered.firstOrNull()?.let { notifyReady(it) }
-                            autoStatus = if (discovered.isEmpty()) "Searching for airline Wi-Fi…" else "Found: " + discovered.joinToString()
-                        }
-                    }
-                    val filter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
-                    registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-                    onDispose { unregisterReceiver(receiver) }
-                }
-                val locationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-                    status = if (granted) "Permission granted. Starting discovery." else "Location permission is needed to see nearby Wi-Fi names."
-                    if (granted) { autoStatus = "Searching for airline Wi-Fi…"; requestScan(); discovered = scanAirlines(); discovered.firstOrNull()?.let { notifyReady(it) } } else autoStatus = "Location access denied. Enable it in Android settings to scan."
-                }
-                LaunchedEffect(Unit) {
-                    if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                        autoStatus = "Location permission needed for automatic Wi-Fi discovery."
-                        locationRequest.launch(Manifest.permission.ACCESS_FINE_LOCATION)
-                    } else {
-                        autoStatus = "Searching for airline Wi-Fi…"
-                        requestScan()
-                        discovered = scanAirlines()
-                        discovered.firstOrNull()?.let { notifyReady(it) }
-                    }
+                    AlertDialog(
+                        onDismissRequest = dismiss,
+                        title = { Text(when (dialog) {
+                            SetupDialog.LOCATION_PERMISSION -> "Allow location for Wi-Fi discovery"
+                            SetupDialog.APP_SETTINGS -> "Enable location access in app settings"
+                            SetupDialog.DEVICE_LOCATION -> "Turn on device Location"
+                        }) },
+                        text = { Text(when (dialog) {
+                            SetupDialog.LOCATION_PERMISSION -> "Android needs precise location permission to show nearby Wi-Fi names. Approximate location is not enough for Wi-Fi scans."
+                            SetupDialog.APP_SETTINGS -> "Android is no longer showing the location prompt. Open Permissions → Location, allow access while using FlightConnect, and enable precise location if shown."
+                            SetupDialog.DEVICE_LOCATION -> "Android requires the device Location switch to be on for Wi-Fi scans. Turn it on, then return to FlightConnect. Discovery will resume automatically."
+                        }) },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                when (dialog) {
+                                    SetupDialog.LOCATION_PERMISSION -> {
+                                        setupDialog = null
+                                        requestLocationAccess()
+                                    }
+                                    SetupDialog.APP_SETTINGS -> openSetupSettings(Intent(
+                                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                        Uri.fromParts("package", packageName, null),
+                                    ))
+                                    SetupDialog.DEVICE_LOCATION -> openSetupSettings(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                                }
+                            }) { Text(if (dialog == SetupDialog.LOCATION_PERMISSION) "Try again" else "Open settings") }
+                        },
+                        dismissButton = { TextButton(onClick = dismiss) { Text("Not now") } },
+                    )
                 }
                 var busy by remember { mutableStateOf(false) }
                 val history = remember { mutableStateListOf<String>() }
@@ -208,7 +408,7 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("FlightConnect", style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.secondary)
-                        Text("Beta 0.7 • Automatic setup and discovery")
+                        Text("Beta 0.8 • Automatic setup and discovery")
                         Text(autoStatus, color = MaterialTheme.colorScheme.secondary)
                         if (intent?.getStringExtra("connect_ssid") != null) {
                             val target = intent.getStringExtra("connect_ssid")!!
@@ -219,16 +419,8 @@ class MainActivity : ComponentActivity() {
                             }, modifier = Modifier.fillMaxWidth()) { Text("Connect to $target") }
                         }
                         Text("Find aircraft Wi-Fi", style = MaterialTheme.typography.titleMedium)
-                        Button(onClick = {
-                            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                                locationRequest.launch(Manifest.permission.ACCESS_FINE_LOCATION)
-                            } else {
-                                requestScan()
-                                discovered = scanAirlines()
-                                status = if (discovered.isEmpty()) "No known airline SSIDs in available scan results. Turn on Location and Wi-Fi, wait, then retry." else "Found: " + discovered.joinToString()
-                                record(status)
-                            }
-                        }, modifier = Modifier.fillMaxWidth()) { Text("Find Airline Wi-Fi") }
+                        Button(onClick = { retryDiscovery() }, enabled = !setupInteractionInProgress,
+                            modifier = Modifier.fillMaxWidth()) { Text("Find Airline Wi-Fi") }
                         discovered.forEach { ssid ->
                             OutlinedButton(onClick = { status = suggestNetwork(ssid); record(status) }, modifier = Modifier.fillMaxWidth()) {
                                 Text("Request connection: $ssid")

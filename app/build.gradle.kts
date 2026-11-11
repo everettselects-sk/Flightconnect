@@ -10,8 +10,8 @@ android {
         applicationId = "com.flightconnect.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.7-beta"
+        versionCode = 8
+        versionName = "0.8-beta"
     }
     buildFeatures { compose = true }
     compileOptions {
@@ -21,6 +21,7 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.compose.material3:material3")
