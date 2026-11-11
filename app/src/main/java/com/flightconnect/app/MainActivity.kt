@@ -179,17 +179,20 @@ class MainActivity : ComponentActivity() {
                     registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
                     onDispose { unregisterReceiver(receiver) }
                 }
+                val locationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                    status = if (granted) "Permission granted. Starting discovery." else "Location permission is needed to see nearby Wi-Fi names."
+                    if (granted) { autoStatus = "Searching for airline Wi-Fi…"; requestScan(); discovered = scanAirlines(); discovered.firstOrNull()?.let { notifyReady(it) } } else autoStatus = "Location access denied. Enable it in Android settings to scan."
+                }
                 LaunchedEffect(Unit) {
-                    if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                    if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                        autoStatus = "Location permission needed for automatic Wi-Fi discovery."
+                        locationRequest.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                    } else {
+                        autoStatus = "Searching for airline Wi-Fi…"
                         requestScan()
                         discovered = scanAirlines()
                         discovered.firstOrNull()?.let { notifyReady(it) }
-                        autoStatus = if (discovered.isEmpty()) "Searching for airline Wi-Fi…" else "Found: " + discovered.joinToString()
-                    } else autoStatus = "Allow location access once to enable Wi-Fi discovery."
-                }
-                val locationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-                    status = if (granted) "Permission granted. Starting discovery." else "Location permission is needed to see nearby Wi-Fi names."
-                    if (granted) { requestScan(); discovered = scanAirlines(); discovered.firstOrNull()?.let { notifyReady(it) } }
+                    }
                 }
                 var busy by remember { mutableStateOf(false) }
                 val history = remember { mutableStateListOf<String>() }
@@ -205,7 +208,7 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("FlightConnect", style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.secondary)
-                        Text("Beta 0.6 • Wi-Fi ready notifications")
+                        Text("Beta 0.7 • Automatic setup and discovery")
                         Text(autoStatus, color = MaterialTheme.colorScheme.secondary)
                         if (intent?.getStringExtra("connect_ssid") != null) {
                             val target = intent.getStringExtra("connect_ssid")!!
