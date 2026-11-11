@@ -10,8 +10,8 @@ android {
         applicationId = "com.flightconnect.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.6-beta"
+        versionCode = 7
+        versionName = "0.7-beta"
     }
     buildFeatures { compose = true }
     compileOptions {
